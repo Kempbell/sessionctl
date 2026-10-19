@@ -1,0 +1,29 @@
+# Config for the `sessions` CLI. Copy to ~/.config/claude-sessions/config.toml,
+# chmod 600, and edit. Format: docs/CONFIG.md.
+
+# Used when neither --profile nor SESSIONS_PROFILE names a profile.
+default_profile = "personal"
+
+# One table per Claude Code account, that is per CLAUDE_CONFIG_DIR.
+[profiles.personal]
+config_dir = "~/.claude-personal"
+registry = "~/.config/claude-sessions/registry.toml"
+charters = "~/.config/claude-sessions/charters"
+# A shell function or alias from your shell rc that runs claude for this account.
+launcher = "claude-personal"
+# Optional: a FIFO of KEY=value lines the launcher sources (a secrets manager's mounted env file).
+secrets_mount = "~/.secrets/claude-personal.env"
+
+[profiles.work]
+config_dir = "~/.claude-work"
+registry = "~/.config/claude-sessions/registry-work.toml"
+charters = "~/.config/claude-sessions/charters-work"
+launcher = "claude-work"
+# No secrets_mount: this launcher only sets CLAUDE_CONFIG_DIR.
+
+[terminal]
+# How a tab is opened for interactive sessions and `attach`. {cmd} becomes
+# "cd <cwd> && <launcher> <flags>". The shell must be interactive (-i) so the launcher
+# exists; "; exec zsh" keeps the tab open. Leave it out to have commands printed instead.
+command = "ptyxis --tab -- zsh -ic '{cmd}; exec zsh'"
+# command = "tmux new-window zsh -ic '{cmd}; exec zsh'"

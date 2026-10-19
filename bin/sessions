@@ -1,0 +1,1193 @@
+#!/usr/bin/env python3
+"""sessions: registry, status, relaunch and creation of long-lived Claude Code sessions.
+
+Profiles (one per Claude Code account, that is per CLAUDE_CONFIG_DIR) come from a TOML
+config file, ~/.config/claude-sessions/config.toml or $SESSIONS_CONFIG (format:
+docs/CONFIG.md), and are never mixed in one listing. Pick one with --profile or
+SESSIONS_PROFILE. Read-only toward live sessions: never kills, signals or messages a
+claude process it did not start, and reads only per-session metadata (state files,
+/proc), never transcripts or session contents.
+"""
+import argparse
+import json
+import os
+import re
+import shlex
+import shutil
+import stat
+import subprocess
+import sys
+import time
+import tomllib
+from dataclasses import dataclass
+from pathlib import Path
+
+NAME = "sessionctl"        # the project's name; the command itself stays `sessions`
+HOME = Path.home()
+SOCK_DIR = Path(f"/run/user/{os.getuid()}/cc-socks")
+REPO = Path(__file__).resolve().parent.parent
+DEFAULT_CONFIG = HOME / ".config" / "claude-sessions" / "config.toml"
+PROFILE_KEYS = ("config_dir", "registry", "charters", "launcher")
+FIELDS = ["name", "purpose", "cwd", "config_dir", "mode", "permission_mode",
+          "model", "name_flag", "last_session_id", "last_pid", "charter", "notes"]
+MODES = ("bg", "interactive")
+UUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+# Per-session variables a calling Claude session would leak into a launch; a fresh
+# terminal running the profile's launcher does not have them, so they are dropped.
+SESSION_ENV_RE = re.compile(r"^(CLAUDECODE|CLAUDE_PID|CLAUDE_JOB_DIR|CLAUDE_EFFORT|CLAUDE_BG_.*"
+                            r"|CLAUDE_BRIDGE_.*|CLAUDE_CODE_(SESSION_.*|CHILD_SESSION|BRIDGE_.*"
+                            r"|MESSAGING_.*|ENTRYPOINT|EXECPATH|SSE_PORT))$")
+DISCOVER_SECONDS = 20
+MAX_PROMPT_BYTES = 100_000
+
+
+@dataclass(frozen=True)
+class Profile:
+    name: str
+    config_dir: str          # CLAUDE_CONFIG_DIR of the account
+    registry: Path
+    charters: Path
+    launcher: str            # what an interactive tab runs (a shell function, alias or command)
+    secrets_mount: Path | None
+
+
+@dataclass(frozen=True)
+class Config:
+    path: Path
+    default_profile: str
+    profiles: dict           # name -> Profile, in file order
+    terminal: str            # tab template with {cmd}; "" = print the command instead
+
+
+CONFIG = None                # set by main()
+
+
+# ------------------------------------------------------------------- config
+
+def expand(raw):
+    return os.path.expanduser(os.path.expandvars(raw))
+
+
+def config_path():
+    raw = os.environ.get("SESSIONS_CONFIG")
+    return Path(expand(raw)) if raw else DEFAULT_CONFIG
+
+
+def missing_config(path):
+    docs, example = REPO / "docs" / "CONFIG.md", REPO / "examples" / "config.toml"
+    where = (f"{tilde(docs)} and {tilde(example)}" if docs.exists()
+             else f"docs/CONFIG.md and examples/config.toml in the {NAME} repo")
+    sys.exit(f"sessions: no config file at {tilde(path)}\n"
+             f"Write one, with a [profiles.<name>] table per Claude Code account; see {where}.\n"
+             "SESSIONS_CONFIG=<path> reads it from somewhere else.")
+
+
+def config_error(path, msg):
+    sys.exit(f"sessions: {tilde(path)}: {msg} (format: docs/CONFIG.md)")
+
+
+def path_value(raw, base):
+    """~ and $VAR expanded; a relative path is relative to the config file's directory."""
+    p = Path(expand(raw))
+    return p if p.is_absolute() else base / p
+
+
+def string_key(path, table, where, key, required=True):
+    v = table.get(key, "")
+    if not isinstance(v, str):
+        config_error(path, f"{where}.{key} must be a string")
+    if required and not v:
+        config_error(path, f"{where} needs {key}")
+    return v
+
+
+def parse_profile(path, name, t):
+    where = f"[profiles.{name}]"
+    if not isinstance(t, dict):
+        config_error(path, f"{where} must be a table")
+    vals = {k: string_key(path, t, where, k) for k in PROFILE_KEYS}
+    mount = string_key(path, t, where, "secrets_mount", required=False)
+    base = path.parent
+    return Profile(name, str(path_value(vals["config_dir"], base)),
+                   path_value(vals["registry"], base), path_value(vals["charters"], base),
+                   vals["launcher"], path_value(mount, base) if mount else None)
+
+
+def load_config(path):
+    try:
+        with open(path, "rb") as fh:
+            raw = tomllib.load(fh)
+    except (OSError, tomllib.TOMLDecodeError) as e:
+        config_error(path, f"cannot read it: {e}")
+    tables = raw.get("profiles")
+    if not isinstance(tables, dict) or not tables:
+        config_error(path, "defines no [profiles.<name>] table")
+    profiles = {name: parse_profile(path, name, t) for name, t in tables.items()}
+    default = string_key(path, raw, "top level", "default_profile", required=False) or next(iter(profiles))
+    if default not in profiles:
+        config_error(path, f"default_profile {default!r} is not one of the [profiles.*] tables")
+    term = raw.get("terminal", {})
+    command = string_key(path, term if isinstance(term, dict) else {}, "[terminal]", "command",
+                         required=False)
+    if command and "{cmd}" not in command:
+        config_error(path, "[terminal] command must contain {cmd}")
+    return Config(path, default, profiles, command)
+
+
+def or_list(names):
+    names = list(names)
+    return ", ".join(names[:-1]) + " or " + names[-1] if len(names) > 1 else "".join(names)
+
+
+def get_profile(args):
+    name = getattr(args, "profile", None) or os.environ.get("SESSIONS_PROFILE") or CONFIG.default_profile
+    if name not in CONFIG.profiles:
+        sys.exit(f"unknown profile {name!r} ({or_list(CONFIG.profiles)})")
+    return CONFIG.profiles[name]
+
+
+def cli(prof):
+    """How to spell this tool for the profile in a hint."""
+    return "sessions" if prof.name == CONFIG.default_profile else f"sessions --profile {prof.name}"
+
+
+def private_dir(d):
+    """Create d as 0700 if it does not exist yet; an existing directory is left as it is."""
+    if not d.is_dir():
+        d.mkdir(parents=True, exist_ok=True)
+        os.chmod(d, 0o700)
+
+
+# ---------------------------------------------------------------- /proc helpers
+
+def pid_alive(pid):
+    return Path(f"/proc/{pid}").exists()
+
+
+def proc_start(pid):
+    """Field 22 of /proc/<pid>/stat (start time in clock ticks), as a string."""
+    try:
+        raw = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    rest = raw[raw.rfind(")") + 2:].split()
+    return rest[19] if len(rest) > 19 else None
+
+
+def proc_env_keys(pid, keys):
+    """Return only the requested environment variables of a process."""
+    try:
+        raw = Path(f"/proc/{pid}/environ").read_bytes()
+    except OSError:
+        return None
+    out = {}
+    for item in raw.split(b"\0"):
+        k, _, v = item.partition(b"=")
+        if k.decode(errors="replace") in keys:
+            out[k.decode()] = v.decode(errors="replace")
+    return out
+
+
+def proc_cmdline(pid):
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return []
+    return [a.decode(errors="replace") for a in raw.split(b"\0") if a]
+
+
+def proc_cwd(pid):
+    try:
+        return os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        return ""
+
+
+def proc_tty(pid):
+    try:
+        return os.readlink(f"/proc/{pid}/fd/0")
+    except OSError:
+        return "?"
+
+
+def proc_config_dir(pid):
+    env = proc_env_keys(pid, {"CLAUDE_CONFIG_DIR"})
+    if not env or "CLAUDE_CONFIG_DIR" not in env:
+        return None
+    return os.path.realpath(env["CLAUDE_CONFIG_DIR"])
+
+
+def flag_value(argv, *names):
+    for i, a in enumerate(argv):
+        for n in names:
+            if a == n and i + 1 < len(argv):
+                return argv[i + 1]
+            if a.startswith(n + "="):
+                return a.split("=", 1)[1]
+    return None
+
+
+def proc_started_at(pid):
+    """Process start as epoch seconds (boot time + /proc stat start ticks)."""
+    ticks = proc_start(pid)
+    try:
+        btime = next(int(l.split()[1]) for l in open("/proc/stat") if l.startswith("btime "))
+    except (OSError, StopIteration):
+        return 0.0
+    return btime + int(ticks or 0) / os.sysconf("SC_CLK_TCK")
+
+
+def socket_owned_by(pid):
+    """True if <pid>.sock was created by the process now holding that pid, not by an
+    earlier process whose pid got reused."""
+    sock = SOCK_DIR / f"{pid}.sock"
+    try:
+        return pid_alive(pid) and sock.stat().st_mtime >= proc_started_at(pid) - 1
+    except OSError:
+        return False
+
+
+def looks_like_claude(argv):
+    first = argv[0].split()[0] if argv else ""
+    return Path(first).name == "claude" or "/claude/versions/" in first
+
+
+def is_spare(argv):
+    """A daemon warm spare (argv[0] is rewritten to 'claude bg-spare'), not its pty host."""
+    return "--bg-spare" in argv and "--bg-pty-host" not in argv
+
+
+# ------------------------------------------------------------ claude metadata
+
+def socket_pids():
+    if not SOCK_DIR.is_dir():
+        return []
+    return [int(p.stem) for p in SOCK_DIR.glob("*.sock") if p.stem.isdigit()]
+
+
+def index_pids(config_dir):
+    d = Path(config_dir) / "sessions"
+    if not d.is_dir():
+        return []
+    return [int(p.stem) for p in d.glob("*.json") if p.stem.isdigit()]
+
+
+def read_index_file(config_dir, pid):
+    try:
+        return json.loads((Path(config_dir) / "sessions" / f"{pid}.json").read_text())
+    except (OSError, ValueError):
+        return None
+
+
+def read_index(config_dir, pid):
+    """sessions/<pid>.json, only if it belongs to the process now holding that pid."""
+    meta = read_index_file(config_dir, pid)
+    if not meta or str(meta.get("procStart")) != str(proc_start(pid)):
+        return None
+    return meta
+
+
+def project_dir(config_dir, cwd):
+    return Path(config_dir) / "projects" / re.sub(r"[^A-Za-z0-9]", "-", cwd)
+
+
+def find_transcript(config_dir, session_id):
+    """Path of a transcript file (existence only; contents are never read)."""
+    hits = sorted((Path(config_dir) / "projects").glob(f"*/{session_id}.jsonl"))
+    return hits[0] if hits else None
+
+
+def job_meta(config_dir, session_id):
+    """Launch metadata of a bg job: cwd, name, template and respawn flags only."""
+    f = Path(config_dir) / "jobs" / session_id[:8] / "state.json"
+    try:
+        st = json.loads(f.read_text())
+    except (OSError, ValueError):
+        return {}
+    if st.get("sessionId") != session_id:
+        return {}
+    flags = st.get("respawnFlags") or []
+    return {"cwd": st.get("cwd") or "", "name": st.get("name") or "",
+            "bg": st.get("template") == "bg",
+            "model": flag_value(flags, "--model") or "",
+            "permission_mode": flag_value(flags, "--permission-mode") or ""}
+
+
+# ------------------------------------------------------------- live sessions
+
+@dataclass
+class Live:
+    pid: int
+    session_id: str
+    name: str
+    cwd: str
+    kind: str
+    status: str
+    job_id: str
+    parked_job: str
+    argv: list
+    source: str
+
+
+def live_from_index(pid, meta, argv):
+    return Live(pid, meta.get("sessionId") or "", meta.get("name") or "",
+                meta.get("cwd") or proc_cwd(pid), meta.get("kind") or "interactive",
+                meta.get("status") or "", meta.get("jobId") or "",
+                meta.get("parkedJobId") or "", argv, "index")
+
+
+def session_id_from_argv(argv):
+    if "--fork-session" in argv and flag_value(argv, "--session-id"):
+        return flag_value(argv, "--session-id")
+    res = flag_value(argv, "--resume", "-r")
+    if res:
+        return Path(res).stem if res.endswith(".jsonl") else res
+    return flag_value(argv, "--session-id") or ""
+
+
+def live_from_cmdline(pid, argv):
+    env = proc_env_keys(pid, {"CLAUDE_CODE_SESSION_KIND"}) or {}
+    return Live(pid, session_id_from_argv(argv), flag_value(argv, "--name", "-n") or "",
+                proc_cwd(pid), env.get("CLAUDE_CODE_SESSION_KIND", "interactive"),
+                "", "", "", argv, "cmdline")
+
+
+def discover_live(prof):
+    """Live sessions of one profile. A process is examined further only when its
+    CLAUDE_CONFIG_DIR is this profile's config dir."""
+    cfg = os.path.realpath(prof.config_dir)
+    found = []
+    for pid in sorted(set(socket_pids()) | set(index_pids(prof.config_dir))):
+        if not pid_alive(pid) or proc_config_dir(pid) != cfg:
+            continue
+        argv = proc_cmdline(pid)
+        meta = read_index(prof.config_dir, pid)
+        if meta:
+            found.append(live_from_index(pid, meta, argv))
+        elif looks_like_claude(argv) and not is_spare(argv) and socket_owned_by(pid):
+            found.append(live_from_cmdline(pid, argv))
+    return found
+
+
+def split_parked(lives):
+    """An interactive session moved to a bg job keeps its process; it is 'parked'."""
+    live_jobs = {l.job_id for l in lives if l.job_id}
+    active = [l for l in lives if not (l.parked_job and l.parked_job in live_jobs)]
+    parked = [l for l in lives if l.parked_job and l.parked_job in live_jobs]
+    return active, parked
+
+
+def active_live(prof):
+    return split_parked(discover_live(prof))[0]
+
+
+def norm(s):
+    return re.sub(r"[^a-z0-9]", "", (s or "").lower())
+
+
+def match_live(entry, active):
+    """(best match, other matches) for a registry entry among active live sessions."""
+    keys = {norm(entry.get("name")), norm(entry.get("name_flag"))} - {""}
+    sid = entry.get("last_session_id")
+    by_id = [l for l in active if sid and l.session_id == sid]
+    by_name = [l for l in active if norm(l.name) in keys and l not in by_id]
+    hits = by_id + by_name
+    return (hits[0], hits[1:]) if hits else (None, [])
+
+
+# ------------------------------------------------------------------ registry
+
+def toml_value(v):
+    if isinstance(v, bool):
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    return json.dumps("" if v is None else str(v), ensure_ascii=False)
+
+
+def registry_header(prof):
+    return (f"# Long-lived Claude Code sessions, {prof.name} profile ({prof.config_dir}).\n"
+            f"# Read by the `sessions` CLI ({NAME}). `register`, `new`, `seed`, `unregister` and `sync`\n"
+            "# rewrite this file; only this header comment survives a rewrite.\n"
+            "# last_pid is tool-managed (spots stale sockets). model = \"\" means: launch with the\n"
+            "# settings.json default model. bg relaunches pass no flags beyond --bg --resume <id>.\n")
+
+
+def load_registry(prof):
+    if not prof.registry.exists():
+        return []
+    with open(prof.registry, "rb") as fh:
+        return tomllib.load(fh).get("session", [])
+
+
+def save_registry(prof, entries):
+    private_dir(prof.registry.parent)
+    parts = [registry_header(prof)]
+    for e in entries:
+        parts.append("\n[[session]]\n")
+        for k in FIELDS:
+            parts.append(f"{k} = {toml_value(e.get(k, 0 if k == 'last_pid' else ''))}\n")
+    tmp = prof.registry.with_suffix(".toml.tmp")
+    tmp.write_text("".join(parts))
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, prof.registry)
+
+
+def find_entry(entries, name):
+    for e in entries:
+        if norm(e.get("name")) == norm(name):
+            return e
+    return None
+
+
+def check_config_dir(entry, prof):
+    cfg = os.path.realpath(entry.get("config_dir") or prof.config_dir)
+    if cfg != os.path.realpath(prof.config_dir):
+        sys.exit(f"{entry.get('name')}: config_dir {cfg} does not belong to the {prof.name} profile")
+
+
+def blank_entry(prof, name):
+    entry = {k: "" for k in FIELDS}
+    entry.update(name=name, name_flag=name, config_dir=prof.config_dir, last_pid=0)
+    return entry
+
+
+# ------------------------------------------------------------ launching
+
+def sanitized_env():
+    return {k: v for k, v in os.environ.items() if not SESSION_ENV_RE.match(k)}
+
+
+def source_mount(env, mount):
+    """Source the secrets FIFO the way the launcher does (`set -a; . <(cat FIFO)`), bounded
+    by perl's alarm 5 so a locked secrets manager cannot hang a launch. Only a FIFO is
+    read; anything else is ignored. Values stay in memory, never printed."""
+    st = mount.stat() if mount.exists() else None
+    if not (st and stat.S_ISFIFO(st.st_mode)):
+        return env
+    script = ('raw=$(perl -e \'alarm 5; exec("cat", $ARGV[0])\' "$1" 2>/dev/null); '
+              'set -a; eval "$raw"; set +a; '
+              'printf "MOUNT_LINES=%s\\0" "$(printf "%s\\n" "$raw" | grep -c =)"; env -0')
+    try:
+        r = subprocess.run(["bash", "-c", script, "_", str(mount)],
+                           capture_output=True, timeout=10, env=env)
+        sourced = dict(i.split("=", 1) for i in r.stdout.decode().split("\0") if "=" in i)
+    except subprocess.TimeoutExpired:
+        sourced = {}
+    mount_lines = int(sourced.pop("MOUNT_LINES", "0") or 0)
+    if mount_lines == 0:
+        print(f"note: {mount.name} added nothing (1Password locked?); launching anyway",
+              file=sys.stderr)
+    return {k: v for k, v in sourced.items() if k not in ("_", "SHLVL")} or env
+
+
+def launch_env(prof):
+    """The environment the profile's launcher gives claude: the calling session's own
+    variables dropped, the secrets mount sourced, CLAUDE_CONFIG_DIR set."""
+    env = sanitized_env()
+    if prof.secrets_mount:
+        env = source_mount(env, prof.secrets_mount)
+    env["CLAUDE_CONFIG_DIR"] = prof.config_dir
+    return env
+
+
+def claude_bin(env):
+    return shutil.which("claude", path=env.get("PATH")) or str(HOME / ".local/bin/claude")
+
+
+def open_tab(prof, inner, dry):
+    """Open a terminal tab from the [terminal] command template, `inner` in place of {cmd}.
+    The template's shell must be interactive (zsh -ic) so the launcher function exists.
+    {cmd} is substituted into its token after splitting, so `inner` is never re-split."""
+    tag = "[dry-run] " if dry else ""
+    if not CONFIG.terminal:
+        print(f"{tag}no [terminal] command in {tilde(CONFIG.path)}; run this in a terminal tab:\n  {inner}")
+        return 0
+    argv = [tok.replace("{cmd}", inner) for tok in shlex.split(CONFIG.terminal)]
+    term = shutil.which(argv[0])
+    if not term:
+        print(f"{tag}{argv[0]} not found; run this in a terminal tab:\n  {inner}")
+        return 0
+    argv[0] = term
+    if dry:
+        print(f"[dry-run] {shlex.join(argv)}")
+        return 0
+    return subprocess.run(argv).returncode
+
+
+# --------------------------------------------------------------- relaunching
+
+def resume_args(entry):
+    """bg: only --bg --resume <id>. A bg session keeps its own saved options, and any
+    extra flag makes claude start a copy under a new id instead of continuing it."""
+    if entry.get("mode") == "bg":
+        return ["--bg", "--resume", entry["last_session_id"]]
+    return (["--resume", entry["last_session_id"]]
+            + option_flags(entry.get("name_flag") or entry["name"],
+                           entry.get("model"), entry.get("permission_mode")))
+
+
+def option_flags(name, model, permission_mode):
+    args = ["--name", name]
+    if permission_mode:
+        args += ["--permission-mode", permission_mode]
+    if model:
+        args += ["--model", model]
+    return args
+
+
+def shell_cmd(entry, prof):
+    """What to type in an interactive shell: the launcher sets the profile's config + env."""
+    return f"cd {shlex.quote(entry['cwd'])} && {prof.launcher} {shlex.join(resume_args(entry))}"
+
+
+def transcript_problem(entry, prof):
+    """None if `claude --resume <id>` in cwd should find the transcript, else why not."""
+    sid = entry.get("last_session_id") or ""
+    if not UUID_RE.match(sid):
+        return f"last_session_id {sid!r} is not a uuid"
+    if (project_dir(prof.config_dir, entry["cwd"]) / f"{sid}.jsonl").exists():
+        return None
+    other = find_transcript(prof.config_dir, sid)
+    if other:
+        return f"transcript is under {other.parent.name}, not this cwd's project dir"
+    return "no transcript for that session id"
+
+
+def launch_bg(entry, prof, dry):
+    if dry:
+        print(f"[dry-run] {shell_cmd(entry, prof)}")
+        return 0
+    env = launch_env(prof)
+    argv = [claude_bin(env)] + resume_args(entry)
+    return subprocess.run(argv, cwd=entry["cwd"], env=env).returncode
+
+
+def relaunch(entry, prof, dry):
+    check_config_dir(entry, prof)
+    problem = transcript_problem(entry, prof)
+    if problem:
+        print(f"{entry['name']}: not relaunching: {problem}", file=sys.stderr)
+        return 1
+    if entry.get("mode") == "bg":
+        return launch_bg(entry, prof, dry)
+    return open_tab(prof, shell_cmd(entry, prof), dry)
+
+
+# ------------------------------------------------------------------- status
+
+def entry_state(entry, active):
+    live, dupes = match_live(entry, active)
+    if live:
+        extra = f" (+{len(dupes)} dup)" if dupes else ""
+        return f"LIVE {live.pid}{extra}", live
+    pid = int(entry.get("last_pid") or 0)
+    if pid and (SOCK_DIR / f"{pid}.sock").exists() and not socket_owned_by(pid):
+        return "STALE-SOCKET", None
+    return "MISSING", None
+
+
+def tilde(path):
+    h = str(HOME)
+    path = str(path)
+    return "~" + path[len(h):] if path == h or path.startswith(h + "/") else path
+
+
+def relaunch_hint(entry, prof):
+    if not UUID_RE.match(entry.get("last_session_id") or ""):
+        return f"    no session id recorded yet; run `{cli(prof)} sync` once it is up"
+    problem = transcript_problem(entry, prof)
+    return f"    relaunch: {shell_cmd(entry, prof)}" + (f"   [!] {problem}" if problem else "")
+
+
+def cmd_status(args):
+    prof = get_profile(args)
+    entries = load_registry(prof)
+    active = active_live(prof)
+    print(f"Profile: {prof.name}  ({tilde(prof.config_dir)}; registry {tilde(prof.registry)})\n")
+    print_table(entries, active, prof)
+    print_unregistered(entries, active, prof)
+    return 0
+
+
+def print_table(entries, active, prof):
+    headers = ["NAME", "MODE", "STATE", "CWD", "LAST SESSION"]
+    rows, extra, missing = [], {}, 0
+    for e in entries:
+        state, live = entry_state(e, active)
+        short = (e.get("last_session_id") or "?")[:8]
+        if live and live.session_id and live.session_id != e.get("last_session_id"):
+            short += "*"
+        rows.append([e["name"], e.get("mode", "?"), state, tilde(e.get("cwd", "")), short])
+        if not live:
+            missing += 1
+            extra[len(rows) - 1] = relaunch_hint(e, prof)
+    widths = [max(len(str(r[i])) for r in rows + [headers]) for i in range(len(headers))]
+    fmt = "  ".join(f"{{:<{w}}}" for w in widths)
+    print(fmt.format(*headers).rstrip())
+    for i, r in enumerate(rows):
+        print(fmt.format(*r).rstrip())
+        if i in extra:
+            print(extra[i])
+    print(f"\n{len(rows) - missing} live, {missing} missing.", end="")
+    print(f"  `{cli(prof)} up --missing` relaunches them." if missing else "")
+    if any(r[4].endswith("*") for r in rows):
+        print(f"* live session id differs from the registry: run `{cli(prof)} sync`.")
+
+
+def unregistered(entries, active):
+    matched = set()
+    for e in entries:
+        best, dupes = match_live(e, active)
+        matched |= {l.pid for l in ([best] if best else []) + dupes}
+    return [l for l in active if l.pid not in matched]
+
+
+def print_unregistered(entries, active, prof):
+    stray = unregistered(entries, active)
+    print("\nUnregistered live sessions:")
+    if not stray:
+        print("  (none)")
+        return
+    width = max(len(l.name or "(unnamed)") for l in stray)
+    for l in stray:
+        print(f"  pid {l.pid:<8} {l.name or '(unnamed)':<{width}}  {l.kind:<11} {tilde(l.cwd):<20} "
+              f"{(l.session_id or '?')[:8]}")
+    print(f"  register: `{cli(prof)} register <name> --pid <pid> --purpose \"...\"`, "
+          f"or all of them: `{cli(prof)} seed`")
+
+
+# ----------------------------------------------------------------------- up
+
+def ask(question):
+    try:
+        return input(f"{question} [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        return False
+
+
+def cmd_up(args):
+    prof = get_profile(args)
+    entries = load_registry(prof)
+    active = active_live(prof)
+    if args.missing:
+        return up_missing(entries, active, prof, args)
+    if not args.name:
+        sys.exit("usage: sessions up <name> [--dry-run]  |  sessions up --missing [--yes] [--dry-run]")
+    entry = find_entry(entries, args.name) or sys.exit(f"{args.name}: not in the {prof.name} registry")
+    state, live = entry_state(entry, active)
+    if live:
+        print(f"{entry['name']} is already {state}; not relaunching (it would start a copy).")
+        if not args.dry_run:
+            return 0
+        print("Command it would run if it were missing:")
+    return relaunch(entry, prof, args.dry_run)
+
+
+def up_missing(entries, active, prof, args):
+    todo = [e for e in entries if not entry_state(e, active)[1]]
+    if not todo:
+        print("Nothing missing.")
+        return 0
+    rc = 0
+    for e in todo:
+        if not (args.dry_run or args.yes or ask(f"Relaunch {e['name']} ({e.get('mode')}) in {tilde(e['cwd'])}?")):
+            print(f"  skipped {e['name']}")
+            continue
+        rc |= relaunch(e, prof, args.dry_run)
+    if not args.dry_run:
+        print(f"Run `{cli(prof)} sync` in a few seconds to record the new pids.")
+    return rc
+
+
+# ---------------------------------------------------------------------- new
+
+def charter_text(path):
+    text = Path(path).read_text()
+    if not text.strip():
+        sys.exit(f"charter {path} is empty")
+    if len(text.encode()) > MAX_PROMPT_BYTES:
+        sys.exit(f"charter {path} is over {MAX_PROMPT_BYTES} bytes; too long for one prompt argument")
+    return text
+
+
+def prompt_arg(text):
+    """The charter as claude's positional prompt. A leading '-' would parse as an
+    option, so such a charter gets a leading newline."""
+    return "\n" + text if text.lstrip().startswith("-") else text
+
+
+def check_new_name(prof, name):
+    if not name or "/" in name or name.startswith("."):
+        sys.exit(f"bad session name {name!r}")
+    entry = find_entry(load_registry(prof), name)
+    if entry:
+        sys.exit(f"{name} is already registered in the {prof.name} profile; "
+                 f"use `{cli(prof)} up {name}` to relaunch it")
+
+
+def new_bg_argv(args, prompt):
+    argv = ["--bg"] + option_flags(args.name, args.model, args.permission_mode)
+    return argv + ([prompt_arg(prompt)] if prompt is not None else [])
+
+
+def new_shell_cmd(args, prof, cwd, charter_dest):
+    flags = (["--bg"] if args.mode == "bg" else []) + option_flags(args.name, args.model,
+                                                                   args.permission_mode)
+    cmd = f"cd {shlex.quote(cwd)} && {prof.launcher} {shlex.join(flags)}"
+    return cmd + (f' "$(cat {shlex.quote(str(charter_dest))})"' if charter_dest else "")
+
+
+def copy_charter(prof, src, name):
+    private_dir(prof.charters)
+    dest = prof.charters / f"{name}.md"
+    if Path(src).resolve() != dest.resolve():
+        shutil.copyfile(src, dest)
+    os.chmod(dest, 0o600)
+    return dest
+
+
+def start_bg(args, prof, cwd, prompt):
+    env = launch_env(prof)
+    argv = [claude_bin(env)] + new_bg_argv(args, prompt)
+    r = subprocess.run(argv, cwd=cwd, env=env, capture_output=True, text=True, timeout=120)
+    sys.stdout.write(r.stdout)
+    sys.stderr.write(r.stderr)
+    if r.returncode != 0:
+        sys.exit(f"claude --bg exited {r.returncode}; nothing registered")
+    plain = re.sub(r"\x1b\[[0-9;]*m", "", r.stdout + r.stderr)
+    found = re.findall(r"\b([0-9a-f]{8})\b", plain)
+    return found[0] if found else ""
+
+
+def wait_for_session(prof, name, before, short=""):
+    """Poll up to DISCOVER_SECONDS for a new live session with this name (or job id)."""
+    deadline = time.time() + DISCOVER_SECONDS
+    while time.time() < deadline:
+        for l in active_live(prof):
+            if l.pid in before:
+                continue
+            if (short and (l.job_id == short or l.session_id.startswith(short))) or norm(l.name) == norm(name):
+                return l
+        time.sleep(1)
+    return None
+
+
+def register_new(prof, args, cwd, charter_dest, live):
+    entries = load_registry(prof)
+    entry = blank_entry(prof, args.name)
+    entry.update(purpose=args.purpose or "", cwd=cwd, mode=args.mode,
+                 permission_mode=args.permission_mode or "", model=args.model or "",
+                 charter=str(charter_dest or ""))
+    if live:
+        entry.update(last_session_id=live.session_id, last_pid=live.pid)
+    entries.append(entry)
+    save_registry(prof, entries)
+    return entry
+
+
+def cmd_new(args):
+    prof = get_profile(args)
+    check_new_name(prof, args.name)
+    cwd = os.path.abspath(args.cwd or os.getcwd())
+    if not os.path.isdir(cwd):
+        sys.exit(f"cwd {cwd} is not a directory")
+    prompt = charter_text(args.charter) if args.charter else None
+    dest_preview = prof.charters / f"{args.name}.md" if args.charter else None
+    if args.dry_run:
+        return new_dry_run(args, prof, cwd, dest_preview)
+    if not (args.yes or ask(f"Start new {args.mode} session {args.name} ({prof.name}) in {tilde(cwd)}?")):
+        print("Not started.")
+        return 1
+    dest = copy_charter(prof, args.charter, args.name) if args.charter else None
+    before = {l.pid for l in discover_live(prof)}
+    short = start_new(args, prof, cwd, prompt, dest)
+    live = wait_for_session(prof, args.name, before, short)
+    entry = register_new(prof, args, cwd, dest, live)
+    report_new(entry, live, prof, prompt is not None)
+    return 0
+
+
+def start_new(args, prof, cwd, prompt, dest):
+    if args.mode == "bg":
+        return start_bg(args, prof, cwd, prompt)
+    open_tab(prof, new_shell_cmd(args, prof, cwd, dest), dry=False)
+    return ""
+
+
+def new_dry_run(args, prof, cwd, dest):
+    if dest:
+        print(f"[dry-run] would copy {args.charter} -> {dest}")
+    cmd = new_shell_cmd(args, prof, cwd, dest)
+    if args.mode == "bg":
+        print(f"[dry-run] {cmd}")
+    else:
+        open_tab(prof, cmd, dry=True)
+    print(f"[dry-run] would register {args.name} in {tilde(prof.registry)} after discovering its pid")
+    return 0
+
+
+def report_new(entry, live, prof, has_prompt):
+    if live:
+        print(f"registered {entry['name']}: pid {live.pid}, session {live.session_id}")
+    else:
+        print(f"registered {entry['name']} without a session id: not seen within "
+              f"{DISCOVER_SECONDS} s; run `{cli(prof)} sync` once it is up")
+    if not has_prompt:
+        print("No charter: the session started idle, waiting for a first message.")
+
+
+# ------------------------------------------------------------------- attach
+
+def cmd_attach(args):
+    prof = get_profile(args)
+    entry = find_entry(load_registry(prof), args.name) or sys.exit(
+        f"{args.name}: not in the {prof.name} registry")
+    _, live = entry_state(entry, active_live(prof))
+    kind = live.kind if live else entry.get("mode")
+    if kind != "bg":
+        return attach_interactive(entry, live, prof)
+    if not live:
+        print(f"{entry['name']} is not running; `{cli(prof)} up {entry['name']}` starts it first.")
+        return 1
+    short = live.job_id or live.session_id[:8]
+    return open_tab(prof, f"{prof.launcher} attach {short}", args.dry_run)
+
+
+def attach_interactive(entry, live, prof):
+    if live:
+        print(f"{entry['name']} is interactive: it already runs in its own terminal "
+              f"(pid {live.pid}, tty {proc_tty(live.pid)}).")
+    else:
+        print(f"{entry['name']} is interactive and not running; "
+              f"`{cli(prof)} up {entry['name']}` opens it in a new tab.")
+    return 0
+
+
+# ------------------------------------------------------ register / seed / rm
+
+def facts_from_pid(pid, prof):
+    if not pid_alive(pid) or proc_config_dir(pid) != os.path.realpath(prof.config_dir):
+        sys.exit(f"pid {pid} is not a live session of the {prof.name} profile")
+    argv = proc_cmdline(pid)
+    meta = read_index(prof.config_dir, pid)
+    live = live_from_index(pid, meta, argv) if meta else live_from_cmdline(pid, argv)
+    jm = job_meta(prof.config_dir, live.session_id) if live.session_id else {}
+    return {"cwd": live.cwd, "last_session_id": live.session_id, "name_flag": live.name,
+            "mode": "bg" if live.kind == "bg" else "interactive", "last_pid": pid,
+            "model": flag_value(argv, "--model") or jm.get("model", ""),
+            "permission_mode": flag_value(argv, "--permission-mode") or jm.get("permission_mode", "")}
+
+
+def facts_from_session_id(sid, prof):
+    if not find_transcript(prof.config_dir, sid):
+        sys.exit(f"no transcript {sid}.jsonl under {prof.config_dir}/projects")
+    jm = job_meta(prof.config_dir, sid)
+    return {"cwd": jm.get("cwd", ""), "last_session_id": sid, "name_flag": jm.get("name", ""),
+            "mode": "bg" if jm.get("bg") else "", "model": jm.get("model", ""),
+            "permission_mode": jm.get("permission_mode", "")}
+
+
+def cmd_register(args):
+    prof = get_profile(args)
+    found = {}
+    if args.pid:
+        found = facts_from_pid(args.pid, prof)
+    elif args.session_id:
+        found = facts_from_session_id(args.session_id, prof)
+    entries = load_registry(prof)
+    entry = find_entry(entries, args.name)
+    is_new = entry is None
+    entry = entry or blank_entry(prof, args.name)
+    entry.update({k: v for k, v in found.items() if v not in ("", None)})
+    explicit = {"cwd": args.cwd, "mode": args.mode, "purpose": args.purpose,
+                "permission_mode": args.permission_mode, "model": args.model,
+                "name_flag": args.name_flag, "charter": args.charter, "notes": args.notes}
+    entry.update({k: v for k, v in explicit.items() if v is not None})
+    problems = validate_entry(entry)
+    if problems:
+        sys.exit(f"{args.name}: " + "; ".join(problems))
+    if is_new:
+        entries.append(entry)
+    save_registry(prof, entries)
+    print(f"{'added' if is_new else 'updated'} {entry['name']} ({prof.name}):")
+    for k in FIELDS:
+        print(f"  {k} = {toml_value(entry.get(k))}")
+    return 0
+
+
+def validate_entry(e):
+    problems = []
+    if e.get("mode") not in MODES:
+        problems.append(f"mode must be one of {MODES} (pass --mode)")
+    if not e.get("cwd") or not os.path.isabs(e["cwd"]):
+        problems.append("cwd must be an absolute path (pass --cwd)")
+    if not UUID_RE.match(e.get("last_session_id") or ""):
+        problems.append("needs a session uuid (pass --pid or --session-id)")
+    return problems
+
+
+def entry_from_live(prof, l):
+    """A registry entry from a per-pid state file's fields only; purpose left empty."""
+    entry = blank_entry(prof, l.name or f"session-{l.session_id[:8]}")
+    entry.update(cwd=l.cwd, mode="bg" if l.kind == "bg" else "interactive",
+                 last_session_id=l.session_id, last_pid=l.pid,
+                 notes=f"seeded from its live state file {time.strftime('%Y-%m-%d')}")
+    return entry
+
+
+def cmd_seed(args):
+    prof = get_profile(args)
+    entries = load_registry(prof)
+    stray = [l for l in unregistered(entries, active_live(prof))
+             if l.source == "index" and UUID_RE.match(l.session_id)]
+    added = []
+    for l in stray:
+        entry = entry_from_live(prof, l)
+        if not find_entry(entries, entry["name"]):
+            entries.append(entry)
+            added.append(entry)
+    if added and not args.dry_run:
+        save_registry(prof, entries)
+    tag = "[dry-run] would add" if args.dry_run else "added"
+    for e in added:
+        print(f"{tag} {e['name']} ({e['mode']}, {tilde(e['cwd'])}, {e['last_session_id'][:8]})")
+    print(f"{len(added)} seeded into {tilde(prof.registry)}" if added else "Nothing to seed.")
+    return 0
+
+
+def cmd_unregister(args):
+    prof = get_profile(args)
+    entries = load_registry(prof)
+    entry = find_entry(entries, args.name) or sys.exit(f"{args.name}: not in the {prof.name} registry")
+    save_registry(prof, [e for e in entries if e is not entry])
+    print(f"removed {entry['name']} from {tilde(prof.registry)} (the session itself is untouched)")
+    return 0
+
+
+# --------------------------------------------------------------------- sync
+
+def cmd_sync(args):
+    prof = get_profile(args)
+    entries = load_registry(prof)
+    active = active_live(prof)
+    changes = []
+    for e in entries:
+        live, _ = match_live(e, active)
+        if live:
+            changes += sync_entry(e, live)
+    if changes:
+        save_registry(prof, entries)
+        print("\n".join(changes))
+    else:
+        print(f"No changes ({prof.name}).")
+    return 0
+
+
+def sync_entry(e, live):
+    changes = []
+    if live.session_id and live.session_id != e.get("last_session_id"):
+        changes.append(f"{e['name']}: last_session_id {e.get('last_session_id') or '-'} -> {live.session_id}")
+        e["last_session_id"] = live.session_id
+    if live.pid != int(e.get("last_pid") or 0):
+        changes.append(f"{e['name']}: last_pid {e.get('last_pid') or '-'} -> {live.pid}")
+        e["last_pid"] = live.pid
+    if live.name and norm(live.name) != norm(e.get("name_flag")):
+        print(f"note: {e['name']} is live as {live.name!r}; name_flag {e.get('name_flag')!r} left as is")
+    if live.kind in MODES and live.kind != e.get("mode"):
+        print(f"note: {e['name']} is live as {live.kind}; registry mode {e.get('mode')!r} left as is")
+    return changes
+
+
+# ------------------------------------------------------------------- doctor
+
+def stale_sockets(prof, entries):
+    """Dead-pid sockets attributable to this profile (registry last_pid or a leftover
+    state file), plus the count of ones whose owner cannot be told."""
+    known = {int(e.get("last_pid") or 0) for e in entries}
+    mine, unknown = [], 0
+    for pid in sorted(socket_pids()):
+        if socket_owned_by(pid):
+            continue
+        if pid in known or read_index_file(prof.config_dir, pid):
+            mine.append((pid, (SOCK_DIR / f"{pid}.sock").stat().st_mtime))
+        else:
+            unknown += 1
+    return mine, unknown
+
+
+def idle_spares(prof):
+    cfg = os.path.realpath(prof.config_dir)
+    out = []
+    for p in Path("/proc").iterdir():
+        if not p.name.isdigit():
+            continue
+        pid = int(p.name)
+        if not is_spare(proc_cmdline(pid)) or proc_config_dir(pid) != cfg:
+            continue
+        if not read_index(prof.config_dir, pid):  # a claimed spare is a real session
+            out.append((pid, proc_cwd(pid)))
+    return sorted(out)
+
+
+def cmd_doctor(args):
+    prof = get_profile(args)
+    entries = load_registry(prof)
+    print(f"Profile: {prof.name}  ({tilde(prof.config_dir)})\n")
+    mine, unknown = stale_sockets(prof, entries)
+    print(f"Stale sockets of this profile in {SOCK_DIR} (pid gone or reused; left in place): {len(mine)}")
+    for pid, mtime in mine:
+        print(f"  {pid}.sock  {time.strftime('%Y-%m-%d %H:%M', time.localtime(mtime))}")
+    print(f"  ({unknown} more dead-pid sockets whose profile can't be told; not listed)")
+    spares = idle_spares(prof)
+    print(f"\nIdle bg-spare processes (daemon warm spares, not sessions): {len(spares)}")
+    for pid, cwd in spares:
+        print(f"  pid {pid}  cwd {tilde(cwd)}")
+    _, parked = split_parked(discover_live(prof))
+    print(f"\nParked interactive sessions (conversation moved to a bg job): {len(parked)}")
+    for l in parked:
+        print(f"  pid {l.pid}  {l.name}  -> job {l.parked_job}")
+    print("\nRegistry transcripts (file exists for last_session_id):")
+    for e in entries:
+        print(f"  {e['name']:<22} {transcript_problem(e, prof) or 'ok'}")
+    return 0
+
+
+# --------------------------------------------------------------------- main
+
+def profile_help():
+    if CONFIG is None:
+        return "a profile from config.toml; env SESSIONS_PROFILE also works"
+    others = [n for n in CONFIG.profiles if n != CONFIG.default_profile]
+    return (f"{CONFIG.default_profile} (default)" + (f", {or_list(others)}" if others else "")
+            + "; env SESSIONS_PROFILE also works")
+
+
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--profile", choices=sorted(CONFIG.profiles) if CONFIG else None,
+                        default=argparse.SUPPRESS, help=profile_help())
+    ap = argparse.ArgumentParser(prog="sessions", parents=[common],
+                                 description=__doc__.split("\n")[0])
+    sub = ap.add_subparsers(dest="cmd")
+    sub.add_parser("status", parents=[common], help="registry sessions: live / missing (default)")
+    add_up_parser(sub, common)
+    add_new_parser(sub, common)
+    att = sub.add_parser("attach", aliases=["open"], parents=[common],
+                         help="open a bg session in a terminal tab (claude attach)")
+    att.add_argument("name")
+    att.add_argument("--dry-run", action="store_true")
+    add_register_parser(sub, common)
+    seed = sub.add_parser("seed", parents=[common],
+                          help="register every unregistered live session from its state file")
+    seed.add_argument("--dry-run", action="store_true")
+    rm = sub.add_parser("unregister", parents=[common], help="remove a registry entry only")
+    rm.add_argument("name")
+    sub.add_parser("sync", parents=[common], help="refresh last_session_id/last_pid from live sessions")
+    sub.add_parser("doctor", parents=[common], help="stale sockets, idle spares, transcript checks")
+    add_send_parser(sub, common)
+    return ap
+
+
+def add_up_parser(sub, common):
+    up = sub.add_parser("up", parents=[common], help="relaunch a session, or all missing ones")
+    up.add_argument("name", nargs="?")
+    up.add_argument("--missing", action="store_true")
+    up.add_argument("--yes", action="store_true", help="don't ask per session")
+    up.add_argument("--dry-run", action="store_true")
+
+
+def add_new_parser(sub, common):
+    new = sub.add_parser("new", parents=[common], help="start and register a new named session")
+    new.add_argument("name")
+    new.add_argument("--mode", choices=MODES, required=True)
+    new.add_argument("--cwd", help="default: the current directory")
+    new.add_argument("--charter", help="file; copied to the charters dir and sent as the first prompt")
+    new.add_argument("--model")
+    new.add_argument("--permission-mode")
+    new.add_argument("--purpose")
+    new.add_argument("--yes", action="store_true", help="no confirmation prompt")
+    new.add_argument("--dry-run", action="store_true")
+
+
+def add_register_parser(sub, common):
+    reg = sub.add_parser("register", parents=[common], help="add or update a registry entry")
+    reg.add_argument("name")
+    src = reg.add_mutually_exclusive_group()
+    src.add_argument("--pid", type=int)
+    src.add_argument("--session-id")
+    for flag in ("--cwd", "--purpose", "--permission-mode", "--model", "--name-flag",
+                 "--charter", "--notes"):
+        reg.add_argument(flag)
+    reg.add_argument("--mode", choices=MODES)
+
+RELAY_MODEL = "haiku"
+
+
+def cmd_send(args):
+    """Relay one message into a session of ANOTHER profile: a one-shot `claude -p` run under
+    that profile whose only tools are ListAgents and SendMessage. Bridges the per-config-dir
+    wall between accounts (profiles). Cents per message, 10-20 s."""
+    prof = get_profile(args)
+    text = sys.stdin.read() if args.message == "-" else args.message
+    text = text.strip()
+    if not text:
+        sys.exit("empty message")
+    sender = args.sender or os.environ.get("SWEEP_JOB") or "sessions"
+    summary = (args.summary or text.splitlines()[0])[:80]
+    body = f"From {sender} (via `sessions --profile {prof.name} send`): {text}"
+    prompt = (
+        "You are a one-shot message relay. Do exactly this and nothing else.\n"
+        "1. Call ListAgents.\n"
+        f"2. If a peer session named exactly {args.name!r} is listed, call SendMessage with "
+        f"to={args.name!r}, summary={summary!r}, and message set to the text between the "
+        "<<< and >>> markers below, verbatim, including its first line.\n"
+        f"3. End with one line: 'DELIVERED to {args.name}' or, if it is not listed, "
+        f"'NOT FOUND: {args.name}; peers: <the names you saw>'. Never send to another session.\n"
+        f"<<<\n{body}\n>>>\n")
+    if args.dry_run:
+        print(f"[dry-run] profile={prof.name} to={args.name} from={sender}\n{body}")
+        return 0
+    env = launch_env(prof)
+    argv = ["timeout", "--kill-after=15", str(args.timeout), claude_bin(env), "-p", prompt,
+            "--model", RELAY_MODEL, "--name", f"relay-{sender}"[:40],
+            "--permission-mode", "dontAsk", "--permission-prompts", "none",
+            "--tools", "SendMessage,ListAgents", "--allowedTools", "SendMessage", "ListAgents",
+            "--strict-mcp-config", "--no-session-persistence", "--output-format", "text",
+            "--max-budget-usd", str(args.budget)]
+    r = subprocess.run(argv, cwd=str(HOME), env=env, capture_output=True, text=True)
+    out = (r.stdout or "").strip()
+    print(out or (r.stderr or "").strip()[-400:])
+    return 0 if "DELIVERED" in out else 1
+
+
+def add_send_parser(sub, common):
+    snd = sub.add_parser("send", parents=[common],
+                         help="relay a message to a session in this profile from any account (cross-account bridge)")
+    snd.add_argument("name", help="target session name as its own ListAgents shows it")
+    snd.add_argument("message", help="the text, or - to read stdin")
+    snd.add_argument("--from", dest="sender", help="who is writing (default: $SWEEP_JOB or 'sessions')")
+    snd.add_argument("--summary")
+    snd.add_argument("--budget", type=float, default=0.5)
+    snd.add_argument("--timeout", type=int, default=150)
+    snd.add_argument("--dry-run", action="store_true")
+
+
+HANDLERS = {None: cmd_status, "status": cmd_status, "up": cmd_up, "new": cmd_new,
+            "attach": cmd_attach, "open": cmd_attach, "register": cmd_register,
+            "seed": cmd_seed, "unregister": cmd_unregister, "sync": cmd_sync,
+            "doctor": cmd_doctor, "send": cmd_send}
+
+
+def main():
+    global CONFIG
+    path = config_path()
+    CONFIG = load_config(path) if path.is_file() else None
+    args = build_parser().parse_args()      # --help works before a config exists
+    if CONFIG is None:
+        missing_config(path)
+    return HANDLERS[args.cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

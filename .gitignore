@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+/.orig-*
+
+# Private state lives in ~/.config/claude-sessions, never in this repo.
+/config.toml
+/registry*.toml
+/charters/

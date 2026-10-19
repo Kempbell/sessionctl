@@ -1,0 +1,36 @@
+# Long-lived Claude Code sessions, personal profile (/home/you/.claude-personal).
+# Read by the `sessions` CLI. `register`, `new`, `seed`, `unregister` and `sync`
+# rewrite this file; only this header comment survives a rewrite.
+# last_pid is tool-managed (spots stale sockets). model = "" means: launch with the
+# settings.json default model. bg relaunches pass no flags beyond --bg --resume <id>.
+#
+# An example only: the paths and session ids below are placeholders. The tool writes
+# absolute paths here; it does not expand ~ in registry entries.
+
+[[session]]
+name = "Inbox"
+purpose = "Reads new mail twice a day and keeps a list of what needs an answer."
+cwd = "/home/you"
+config_dir = "/home/you/.claude-personal"
+mode = "bg"
+permission_mode = "auto"
+model = ""
+name_flag = "Inbox"
+last_session_id = "00000000-0000-4000-8000-000000000001"
+last_pid = 0
+charter = "/home/you/.config/claude-sessions/charters/Inbox.md"
+notes = "In-session schedule: mail check at 07:00 and 17:00; re-create it after a resume if it lapsed."
+
+[[session]]
+name = "Blog"
+purpose = "Writing partner for the blog repo, in its own terminal tab."
+cwd = "/home/you/src/blog"
+config_dir = "/home/you/.claude-personal"
+mode = "interactive"
+permission_mode = ""
+model = ""
+name_flag = "Blog"
+last_session_id = "00000000-0000-4000-8000-000000000002"
+last_pid = 0
+charter = ""
+notes = ""
