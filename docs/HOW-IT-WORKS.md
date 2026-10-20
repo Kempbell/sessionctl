@@ -26,7 +26,7 @@ For each candidate pid (from the socket names and the state file names):
 - `/proc/<pid>/cwd`: the working directory, when the state file has none.
 - `/proc/<pid>/fd/0`: the tty of an interactive session, printed by `attach`.
 
-`doctor` also reads the command line of every process, to find warm spares.
+`doctor` and `init` also read the command line of every process: `doctor` to find warm spares, `init` to find `claude` processes, whose `CLAUDE_CONFIG_DIR` it then reads as above.
 
 A live session comes from its state file when one is valid. Otherwise it is built from the command line, but only when the process is `claude`, is not a warm spare, and owns its socket.
 
@@ -43,6 +43,12 @@ The launch record of a bg job. Used by `register --pid` and `register --session-
 `<config>/projects/<cwd with every non-alphanumeric character replaced by "-">/<session id>.jsonl`
 
 `claude --resume <id>` finds a transcript only under the project folder of the directory it runs in. Before a relaunch the tool checks that this file exists. If it does not, it searches `<config>/projects/*/` for the file name to say where the transcript went (for example, under a worktree's project folder), and refuses that relaunch. `doctor` runs the same check for every entry. Transcript files are never opened.
+
+### `init`: candidate config dirs and shell rc files
+
+`sessions init` looks for Claude Code config dirs in its own `CLAUDE_CONFIG_DIR`, `~/.claude`, `~/.claude-*`, the `CLAUDE_CONFIG_DIR` of every running `claude` process (from `/proc/<pid>/environ`, as above; a process without it means `~/.claude`) and each `--config-dir`. A directory counts when it holds at least one of `settings.json`, `.credentials.json`, `projects`, `sessions`, `statsig` or `todos`. Only their existence is checked; none of them is opened.
+
+To find each one's launcher it reads `$ZDOTDIR/.zshenv`, `.zshrc` and `.zprofile`, then `~/.zshenv`, `~/.zshrc`, `~/.zprofile`, `~/.bashrc`, `~/.bash_profile`, `~/.profile` and `~/.bash_aliases`. From a line that sets `CLAUDE_CONFIG_DIR=<value>` it keeps only that value and the name of the function or alias that holds the line, found by looking at most 40 lines up. Nothing else in those files is kept, read out or printed, since rc files can hold secrets. It also checks whether your shell rc already sources `launchers.sh`.
 
 ## How a registry entry is matched to a live session
 
@@ -70,6 +76,7 @@ A charter is passed as the positional prompt. A charter that starts with `-` get
 - The profile's registry file: written to a `.tmp` file next to it and renamed into place, mode 0600.
 - Charter copies in the profile's charters dir, mode 0600.
 - The registry's directory and the charters dir, mode 0700, only if they do not exist yet.
+- `init`: the config file and, when some account has no launcher, `launchers.sh` next to it, each written atomically with mode 0600, in a directory created with mode 0700 if it does not exist. With `--force` the old config is renamed to `config.toml.<YYYYmmdd-HHMMSS>.bak` first, and an existing `launchers.sh` with other content is kept the same way. It also appends at most one line to your shell rc, the one that sources `launchers.sh`, and only after you say yes or with `--yes`.
 
 Nothing else. It never writes into a Claude Code config dir or `/run/user/<uid>`.
 
@@ -82,3 +89,4 @@ Nothing else. It never writes into a Claude Code config dir or `/run/user/<uid>`
 - Relaunch a session that is already live.
 - Print a secret. Values from `secrets_mount` stay in the launch environment.
 - Mix profiles. Each listing and each launch is limited to one profile's config dir.
+- Write into a Claude Code config dir. `init` refuses a `SESSIONS_CONFIG` inside one, and it copies nothing from your shell rc but a launcher's name.

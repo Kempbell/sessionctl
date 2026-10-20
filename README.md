@@ -17,21 +17,20 @@ Every session process dies on a reboot or logout, but its transcript survives on
 
 ## Install
 
-Clone the repository anywhere; below, `<repo>` is the clone's path.
-
 ```sh
-ln -s <repo>/bin/sessions ~/.local/bin/sessions
-ln -s <repo>/bin/sessions ~/.local/bin/sessionctl      # optional second name, same tool
-mkdir -p ~/.config/claude-sessions && chmod 700 ~/.config/claude-sessions
-cp <repo>/examples/config.toml ~/.config/claude-sessions/config.toml
-chmod 600 ~/.config/claude-sessions/config.toml
-$EDITOR ~/.config/claude-sessions/config.toml
-sessions doctor
+git clone https://github.com/Kempbell/sessionctl
+sessionctl/install.sh
 ```
 
-The config names each profile's config dir, registry, charters dir, launcher and optional secrets mount, plus how to open a terminal tab. `docs/CONFIG.md` is the full format. Without a config file the tool stops and says where to find it; it never falls back to built-in paths. `SESSIONS_CONFIG=<path>` reads the config from somewhere else.
+`install.sh` links `sessions`, and the same tool as `sessionctl`, into `~/.local/bin` (or `$SESSIONCTL_BIN_DIR`), then runs `sessions init`. Init writes the config from what your machine has: one profile per Claude Code config dir it finds in `~/.claude`, `~/.claude-*` and the environment of running `claude` processes, each with the launcher your shell rc already defines for it or, when there is none, a generated one in `launchers.sh` next to the config, plus the terminal it detects for opening tabs. It shows you the whole plan and asks before it writes anything. `--dry-run` prints the plan only, `--yes` skips the questions, and `--force` replaces an existing config, keeping a `.bak` copy. `install.sh` passes these through.
 
-Each profile needs a launcher: a shell function or alias that runs `claude` with that account's `CLAUDE_CONFIG_DIR`. Interactive tabs run it through an interactive shell, so it must be defined in your shell rc.
+Or hand the clone to your agent: `AGENTS.md` is the same procedure written for it.
+
+To do it by hand instead, write the config from `docs/CONFIG.md` and `examples/config.toml`, then run `sessions doctor`.
+
+The config names each profile's config dir, registry, charters dir, launcher and optional secrets mount, plus how to open a terminal tab. Without a config file the tool stops and says how to write one; it never falls back to built-in paths. `SESSIONS_CONFIG=<path>` reads the config from somewhere else.
+
+Each profile needs a launcher: a shell function or alias that runs `claude` with that account's `CLAUDE_CONFIG_DIR`. Interactive tabs run it through an interactive shell, so it must be defined in your shell rc, or in a file your shell rc sources, as `launchers.sh` is.
 
 Then register what is already running with `sessions seed` (purposes empty) or `sessions register`, or start new sessions with `sessions new`.
 
@@ -45,6 +44,7 @@ Run the same three with `--profile <name>` for each other account.
 
 ## Commands
 
+- `sessions init [--dry-run] [--yes] [--force] [--config-dir DIR]`: write the config from the Claude Code accounts on this machine (see Install). It is the one command that runs without a config, and it stops if one exists unless you pass `--force`. `--config-dir`, repeatable, adds a config dir it would not find by itself.
 - `sessions` or `sessions status`: the table above.
 - `sessions up <name>` or `sessions up --missing [--yes] [--dry-run]`: relaunch one session, or every missing one. A session that is already live is never relaunched, since that would start a copy.
 - `sessions sync`: refresh `last_session_id` and `last_pid` from the live sessions.
@@ -57,7 +57,7 @@ Run the same three with `--profile <name>` for each other account.
 
 `send`, the relay between accounts, has its own section below.
 
-Every command takes `--profile <name>`, before or after the subcommand, or `SESSIONS_PROFILE=<name>` in the environment. Without either it uses `default_profile` from the config.
+Every command except `init` takes `--profile <name>`, before or after the subcommand, or `SESSIONS_PROFILE=<name>` in the environment. Without either it uses `default_profile` from the config.
 
 In the table, `LIVE <pid> (+N dup)` means more than one live session matches the entry, and a `*` after the short session id means the live session's id differs from the registry; `sessions sync` records the new one.
 

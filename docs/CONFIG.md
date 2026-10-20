@@ -6,9 +6,11 @@ The `sessions` CLI reads one TOML file. This page is the standard for it.
 
 - Default: `~/.config/claude-sessions/config.toml`.
 - `SESSIONS_CONFIG=<path>` reads another file instead (`~` and `$VAR` are expanded).
-- If the file does not exist, every command except `--help` stops with a message that points here and at `examples/config.toml`. There is no built-in fallback.
+- If the file does not exist, every command except `init` and `--help` stops with a message that points at `sessions init`, here and `examples/config.toml`. There is no built-in fallback.
 
-Keep the file private (`chmod 600`). It holds no secrets itself, but it names where they are.
+`sessions init` writes this file from what your machine has: a profile for each Claude Code config dir it finds, the launcher your shell rc defines for each one, and the terminal it detects. The profile for `~/.claude` is named `default` and gets `registry = "registry.toml"` and `charters = "charters"`; every other profile gets `registry-<name>.toml` and `charters-<name>`, relative to the config file's directory. It prints the file before writing it and never replaces an existing one unless you pass `--force`, which first renames the old one to `config.toml.<YYYYmmdd-HHMMSS>.bak`.
+
+Keep the file private (`chmod 600`, which is how `init` writes it). It holds no secrets itself, but it names where they are.
 
 ## Example
 
@@ -106,6 +108,14 @@ claude-personal() {
   )
 }
 ```
+
+`sessions init` takes each profile's launcher from your shell rc: the function or alias whose body sets that `CLAUDE_CONFIG_DIR`, or plain `claude` when the rc exports it globally. `~/.claude` with no launcher of its own gets plain `claude`. For any other config dir with no launcher it generates a function, `claude-<profile>() { CLAUDE_CONFIG_DIR="$HOME/.claude-<x>" command claude "$@"; }`, in `launchers.sh` next to the config file (mode 0600), and offers to append the one line that sources that file to your shell rc (`~/.zshrc` or `~/.bashrc`, by `$SHELL`):
+
+```sh
+[ -f "$HOME/.config/claude-sessions/launchers.sh" ] && . "$HOME/.config/claude-sessions/launchers.sh"
+```
+
+A generated launcher sets only the config dir. If the account has secrets, write your own launcher as above and change `launcher` to its name.
 
 The tool runs bg launches and `send` without the launcher: it starts `claude` directly with the environment the launcher would give it (the calling session's own variables removed, `secrets_mount` sourced, `CLAUDE_CONFIG_DIR` set). So `config_dir` and `secrets_mount` must match what the launcher does.
 

@@ -3,10 +3,10 @@
 
 Profiles (one per Claude Code account, that is per CLAUDE_CONFIG_DIR) come from a TOML
 config file, ~/.config/claude-sessions/config.toml or $SESSIONS_CONFIG (format:
-docs/CONFIG.md), and are never mixed in one listing. Pick one with --profile or
-SESSIONS_PROFILE. Read-only toward live sessions: never kills, signals or messages a
-claude process it did not start, and reads only per-session metadata (state files,
-/proc), never transcripts or session contents.
+docs/CONFIG.md; `sessions init` writes it), and are never mixed in one listing. Pick
+one with --profile or SESSIONS_PROFILE. Read-only toward live sessions: never kills,
+signals or messages a claude process it did not start, and reads only per-session
+metadata (state files, /proc), never transcripts or session contents.
 """
 import argparse
 import json
@@ -78,7 +78,8 @@ def missing_config(path):
     where = (f"{tilde(docs)} and {tilde(example)}" if docs.exists()
              else f"docs/CONFIG.md and examples/config.toml in the {NAME} repo")
     sys.exit(f"sessions: no config file at {tilde(path)}\n"
-             f"Write one, with a [profiles.<name>] table per Claude Code account; see {where}.\n"
+             "`sessions init` writes one from the Claude Code accounts this machine has.\n"
+             f"Or write it by hand, with a [profiles.<name>] table per Claude Code account; see {where}.\n"
              "SESSIONS_CONFIG=<path> reads it from somewhere else.")
 
 
@@ -1053,6 +1054,383 @@ def cmd_doctor(args):
     return 0
 
 
+# --------------------------------------------------------------------- init
+
+MARKERS = ("settings.json", ".credentials.json", "projects", "sessions", "statsig", "todos")
+RC_NAMES = (".zshenv", ".zshrc", ".zprofile", ".bashrc", ".bash_profile", ".profile", ".bash_aliases")
+# CLAUDE_CONFIG_DIR=<value>, the value "double" or 'single' quoted, or bare.
+CCD_RE = re.compile(r"(?<!\w)CLAUDE_CONFIG_DIR=(?:\\?\"([^\"\\]*)\\?\"|'([^']*)'|([^\s\"';&|)`]+))")
+# A definition that can hold such a line: name() {, function name, alias name=
+DEF_RE = re.compile(r"^\s*(?:function\s+([\w.:-]+)|([\w.:-]+)\s*\(\s*\)|alias\s+([\w.:-]+)=)")
+DEF_LOOKBACK = 40
+TMUX_TERMINAL = "tmux new-window {sh} -ic '{cmd}; exec {sh}'"
+TERMINALS = (("ptyxis", "ptyxis --tab -- {sh} -ic '{cmd}; exec {sh}'"),
+             ("gnome-terminal", "gnome-terminal --tab -- {sh} -ic '{cmd}; exec {sh}'"),
+             ("konsole", "konsole --new-tab -e {sh} -ic '{cmd}; exec {sh}'"),
+             ("kitty", "kitty {sh} -ic '{cmd}; exec {sh}'"),
+             ("wezterm", "wezterm cli spawn -- {sh} -ic '{cmd}; exec {sh}'"),
+             ("alacritty", "alacritty -e {sh} -ic '{cmd}; exec {sh}'"))
+
+
+@dataclass(frozen=True)
+class Found:
+    name: str                # profile name
+    config_dir: str          # absolute, as first seen; deduped by realpath
+    launcher: str
+    rc: Path | None          # the rc file the launcher was found in
+    generated: bool          # a claude-<name> function written to launchers.sh
+
+
+def is_claude_dir(d):
+    """A directory holding at least one thing Claude Code keeps in its config dir."""
+    return os.path.isdir(d) and any(os.path.exists(os.path.join(d, m)) for m in MARKERS)
+
+
+def running_config_dirs():
+    """CLAUDE_CONFIG_DIR of every running claude process (unset means ~/.claude). Only that
+    variable is read; another user's process has an unreadable environ and is skipped."""
+    out = []
+    for p in Path("/proc").iterdir():
+        if not p.name.isdigit():
+            continue
+        pid = int(p.name)
+        argv = proc_cmdline(pid)
+        if not looks_like_claude(argv) or is_spare(argv):
+            continue
+        env = proc_env_keys(pid, {"CLAUDE_CONFIG_DIR"})
+        if env is not None:
+            d = env.get("CLAUDE_CONFIG_DIR") or str(HOME / ".claude")
+            out.append(os.path.join(proc_cwd(pid), d))   # a relative one is relative to it
+    return out
+
+
+def config_dir_candidates(extra):
+    """Claude Code config dirs, deduped by realpath, in this order: this process's
+    CLAUDE_CONFIG_DIR, ~/.claude, ~/.claude-*, those of running claude processes, --config-dir."""
+    raw = [os.environ.get("CLAUDE_CONFIG_DIR") or "", str(HOME / ".claude")]
+    raw += sorted(str(p) for p in HOME.glob(".claude-*")) + running_config_dirs()
+    seen, out = set(), []
+    for d, given in [(r, False) for r in raw if r] + [(expand(r), True) for r in extra]:
+        d = os.path.abspath(d)
+        if os.path.realpath(d) in seen:
+            continue
+        if not is_claude_dir(d):
+            if given:
+                print(f"note: {tilde(d)} skipped: not a directory holding {or_list(MARKERS)}",
+                      file=sys.stderr)
+            continue
+        seen.add(os.path.realpath(d))
+        out.append(d)
+    return out
+
+
+def rc_files():
+    """The shell rc files that exist, in the order they are scanned for launchers."""
+    zdot = Path(os.environ.get("ZDOTDIR") or HOME)
+    out = []
+    for f in [zdot / n for n in RC_NAMES[:3]] + [HOME / n for n in RC_NAMES]:
+        if f.is_file() and f not in out:
+            out.append(f)
+    return out
+
+
+def rc_dir(raw):
+    """A CLAUDE_CONFIG_DIR value from an rc file as a realpath; None unless it is a plain
+    path once ~ and $VARs are expanded (a function argument like "$1" is not)."""
+    v = expand(raw)
+    return os.path.realpath(v) if os.path.isabs(v) and "$" not in v else None
+
+
+def enclosing_def(lines, i):
+    """Name of the function or alias holding line i: the nearest definition at most
+    DEF_LOOKBACK lines up, unless a block closes or a one-line definition ends in between."""
+    for j in range(i, max(i - DEF_LOOKBACK - 1, -1), -1):
+        m = DEF_RE.match(lines[j])
+        if m and j < i and (m.group(3) or lines[j].strip().rstrip(";").endswith("}")):
+            return None                             # an alias or a one-line function above
+        if m:
+            return next(g for g in m.groups() if g)
+        if lines[j].strip().startswith("}"):
+            return None                             # a block closed above this line
+    return None
+
+
+def rc_launchers(files):
+    """{realpath of a config dir: (launcher, rc file)} from each CLAUDE_CONFIG_DIR=<value>
+    line; an `export` outside any definition makes plain `claude` the launcher. Only the
+    value and the definition's name are kept: nothing else of an rc file is stored or
+    printed, since rc files can hold secrets. The first match per dir wins."""
+    found = {}
+    for f in files:
+        try:
+            lines = f.read_text(errors="replace").splitlines()
+        except OSError:
+            continue
+        for i, line in enumerate(lines):
+            if line.lstrip().startswith("#"):
+                continue
+            for m in CCD_RE.finditer(line):
+                d = rc_dir(next(g for g in m.groups() if g is not None))
+                name = enclosing_def(lines, i)
+                if name is None and line.lstrip().startswith("export"):
+                    name = "claude"                 # a global default
+                if d and name and d not in found:
+                    found[d] = (name, f)
+    return found
+
+
+def profile_base(d):
+    if os.path.realpath(d) == os.path.realpath(HOME / ".claude"):
+        return "default"
+    base = re.sub(r"^\.?(claude[-_.])?", "", Path(d).name)
+    return re.sub(r"[^A-Za-z0-9_-]", "-", base) or "profile"
+
+
+def unique(base, taken):
+    name, n = base, 2
+    while name in taken:
+        name, n = f"{base}{n}", n + 1
+    return name
+
+
+def plan_profiles(dirs, rc):
+    """One Found per config dir. Its launcher comes from the rc, else is plain claude for
+    ~/.claude (unless an exported CLAUDE_CONFIG_DIR claimed that), else is generated."""
+    home_claude = os.path.realpath(HOME / ".claude")
+    names = {}
+    for d in sorted(dirs, key=lambda d: os.path.realpath(d) != home_claude):  # "default" first
+        names[d] = unique(profile_base(d), set(names.values()))
+    claude_free = all(name != "claude" for name, _ in rc.values())
+    out = []
+    for d in dirs:
+        real, name = os.path.realpath(d), names[d]
+        if real in rc:
+            out.append(Found(name, d, rc[real][0], rc[real][1], False))
+        elif real == home_claude and claude_free:
+            out.append(Found(name, d, "claude", None, False))
+        else:
+            out.append(Found(name, d, f"claude-{name}", None, True))
+    return out
+
+
+def pick_default(found):
+    """The profile of this process's CLAUDE_CONFIG_DIR (an agent running init from inside a
+    session sets things up for that account), else `default`, else the first."""
+    me = os.environ.get("CLAUDE_CONFIG_DIR")
+    for f in found:
+        if me and os.path.realpath(f.config_dir) == os.path.realpath(me):
+            return f.name
+    return "default" if any(f.name == "default" for f in found) else found[0].name
+
+
+def login_shell():
+    sh = Path(os.environ.get("SHELL", "")).name
+    return sh if sh in ("zsh", "bash") else "bash"
+
+
+def detect_terminal():
+    """A [terminal] command template: a tmux window inside tmux, else the first terminal on
+    PATH that opens a tab from the command line, else "" (commands get printed)."""
+    if os.environ.get("TMUX"):
+        tmpl = TMUX_TERMINAL
+    else:
+        tmpl = next((t for prog, t in TERMINALS if shutil.which(prog)), "")
+    return tmpl.replace("{sh}", login_shell())      # not format(): {cmd} must survive
+
+
+def shell_rc():
+    sh = os.environ.get("SHELL", "")
+    if sh.endswith("zsh"):
+        return Path(os.environ.get("ZDOTDIR") or HOME) / ".zshrc"
+    return HOME / ".bashrc" if sh.endswith("bash") else None
+
+
+def sh_word(path):
+    """path as a double-quoted shell word, spelled $HOME/... when it is under HOME."""
+    p, h = str(path), str(HOME)
+    under = p.startswith(h + "/")
+    body = re.sub(r'([\\"$`])', r"\\\1", p[len(h):] if under else p)
+    return f'"$HOME{body}"' if under else f'"{body}"'
+
+
+def source_line(launchers):
+    return f"[ -f {sh_word(launchers)} ] && . {sh_word(launchers)}"
+
+
+def origin(f, launchers=None):
+    """Where a profile's launcher comes from: the plan says "generated", the config file
+    names the launchers file."""
+    if f.generated:
+        return f"written to {tilde(launchers)}" if launchers else "generated"
+    return f"found in {tilde(f.rc)}" if f.rc else "default for ~/.claude"
+
+
+def init_config_text(found, default, terminal, launchers):
+    lines = [f"# Config for the `sessions` CLI ({NAME}), written by `sessions init` on "
+             f"{time.strftime('%Y-%m-%d')}.",
+             "# Format: docs/CONFIG.md. One [profiles.<name>] table per Claude Code account.",
+             '# A profile may add secrets_mount = "<FIFO of KEY=value lines>" that its launcher',
+             "# sources; see docs/CONFIG.md.",
+             "", f"default_profile = {toml_value(default)}"]
+    for f in found:
+        suffix = "" if f.name == "default" else f"-{f.name}"
+        lines += ["", f"[profiles.{f.name}]",
+                  f"config_dir = {toml_value(tilde(f.config_dir))}",
+                  f"registry = {toml_value(f'registry{suffix}.toml')}",
+                  f"charters = {toml_value(f'charters{suffix}')}",
+                  f"launcher = {toml_value(f.launcher)}  # {origin(f, launchers)}"]
+    lines += ["", "[terminal]"]
+    if terminal:
+        lines += ["# How a tab is opened for interactive sessions and `attach`; see docs/CONFIG.md.",
+                  f"command = {toml_value(terminal)}"]
+    else:
+        example = TERMINALS[0][1].replace("{sh}", login_shell())
+        lines += ["# No terminal found that opens a tab from the command line, so the commands are",
+                  "# printed for you to paste. To open tabs instead, set one, for example:",
+                  f"# command = {toml_value(example)}"]
+    text = "\n".join(lines) + "\n"
+    tomllib.loads(text)                             # a bug here must not reach the disk
+    return text
+
+
+def launchers_text(found, launchers):
+    lines = ["# Launchers for the Claude Code accounts that had none in your shell rc, written by",
+             f"# `sessions init` ({NAME}) on {time.strftime('%Y-%m-%d')}. Each one runs claude with that",
+             "# account's CLAUDE_CONFIG_DIR. Source this file from your shell rc with this line:",
+             f"# {source_line(launchers)}", ""]
+    lines += [f'{f.launcher}() {{ CLAUDE_CONFIG_DIR={sh_word(f.config_dir)} command claude "$@"; }}'
+              for f in found if f.generated]
+    return "\n".join(lines) + "\n"
+
+
+def rc_sources(rc, launchers):
+    """Whether rc already sources the launchers file (its dir and name appear in it)."""
+    try:
+        return f"{launchers.parent.name}/{launchers.name}" in rc.read_text(errors="replace")
+    except OSError:
+        return False
+
+
+def exists_note(p, text, config):
+    if not p.exists():
+        return ""
+    if p == config:
+        return " (exists; --force replaces it and keeps a .bak copy)"
+    if p.read_text() == text:
+        return " (exists, unchanged)"
+    return " (exists; the old one is kept as a .bak copy)"
+
+
+def print_init_plan(found, texts, config, launchers, rc):
+    print(f"Found {len(found)} Claude Code config dir(s):")
+    w1 = max(len(f.name) for f in found)
+    w2 = max(len(tilde(f.config_dir)) for f in found)
+    for f in found:
+        print(f"  {f.name:<{w1}}  {tilde(f.config_dir):<{w2}}  launcher {f.launcher} ({origin(f)})")
+    for p, text in texts.items():
+        print(f"\n{tilde(p)}{exists_note(p, text, config)}:\n")
+        print(text, end="")
+    if launchers not in texts:
+        return
+    print(f"\nThe generated launchers exist in a shell that sources {tilde(launchers)}, with this line:")
+    print(f"  {source_line(launchers)}")
+    if rc is None:
+        print("Your shell is not zsh or bash, so add that line to its rc yourself.")
+    elif rc_sources(rc, launchers):
+        print(f"{tilde(rc)} already sources it.")
+    else:
+        print(f"`sessions init` asks before appending it to {tilde(rc)}.")
+
+
+def write_private(path, text):
+    """Atomic write, mode 0600, in a 0700 directory if it has to be created."""
+    private_dir(path.parent)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+
+
+def write_init(texts, config):
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    for p, text in texts.items():
+        if p.exists() and (p == config or p.read_text() != text):
+            bak = p.with_name(f"{p.name}.{stamp}.bak")
+            os.rename(p, bak)                       # keeps its mode
+            print(f"kept the old {p.name} as {tilde(bak)}")
+        write_private(p, text)
+        print(f"wrote {tilde(p)}")
+
+
+def offer_rc_line(rc, launchers, yes):
+    line = source_line(launchers)
+    if rc is None:
+        print(f"Add this line to your shell rc so the launchers exist in new shells:\n  {line}")
+    elif rc_sources(rc, launchers):
+        print(f"{tilde(rc)} already sources {launchers.name}; nothing appended.")
+    elif yes or ask(f"  {line}\nAppend that line to {tilde(rc)}?"):
+        with open(rc, "a") as fh:
+            fh.write(f"\n{line}\n")
+        print(f"appended it to {tilde(rc)}")
+    else:
+        print(f"Not appended. Add this line to {tilde(rc)} yourself:\n  {line}")
+
+
+def print_init_next(found, default, config, rc, generated):
+    print("\nNext:")
+    step = 1
+    if generated:
+        how = f"or run `source {tilde(rc)}`, " if rc else ""
+        print(f"  {step}. Open a new shell, {how}so the generated launchers exist.")
+        step += 1
+    if config != DEFAULT_CONFIG:
+        print(f"  {step}. Keep SESSIONS_CONFIG={tilde(config)} set: the config is not at the default path.")
+        step += 1
+    print(f"  {step}. `sessions` prints the table of registered sessions.")
+    print(f"  {step + 1}. `sessions seed` registers what is already running in the {default} profile.")
+    others = [f.name for f in found if f.name != default]
+    if others:
+        print("     For each other profile:")
+        for name in others:
+            print(f"       sessions --profile {name} seed")
+
+
+def cmd_init(args):
+    """Write the config (and launchers for accounts without one) from what this machine has.
+    Never reads CONFIG, so it runs with no config file, or a broken one it replaces."""
+    path = config_path()
+    if path.exists() and not (args.force or args.dry_run):
+        sys.exit(f"sessions: {tilde(path)} already exists. `sessions init --dry-run` prints what it "
+                 "would write; `sessions init --force` replaces it, keeping a .bak copy.")
+    dirs = config_dir_candidates(args.config_dir)
+    if not dirs:
+        sys.exit("sessions: no Claude Code config dir found. Looked at $CLAUDE_CONFIG_DIR, ~/.claude, "
+                 "~/.claude-* and the CLAUDE_CONFIG_DIR of running claude processes; a dir counts when "
+                 f"it holds {or_list(MARKERS)}.\n`sessions init --config-dir PATH` adds one.")
+    inside = [d for d in dirs if Path(os.path.realpath(path.parent)).is_relative_to(os.path.realpath(d))]
+    if inside:
+        sys.exit(f"sessions: {tilde(path)} is inside the Claude Code config dir {tilde(inside[0])}, "
+                 "and init never writes there; point SESSIONS_CONFIG somewhere else.")
+    found = plan_profiles(dirs, rc_launchers(rc_files()))
+    default, launchers, rc = pick_default(found), path.parent / "launchers.sh", shell_rc()
+    texts = {path: init_config_text(found, default, detect_terminal(), launchers)}
+    generated = any(f.generated for f in found)
+    if generated:
+        texts[launchers] = launchers_text(found, launchers)
+    print_init_plan(found, texts, path, launchers, rc)
+    if args.dry_run:
+        print("\n[dry-run] nothing written.")
+        return 0
+    if not (args.yes or ask(f"\nWrite {' and '.join(tilde(p) for p in texts)}?")):
+        print("Nothing written.")
+        return 1
+    write_init(texts, path)
+    if generated:
+        offer_rc_line(rc, launchers, args.yes)
+    print_init_next(found, default, path, rc, generated)
+    return 0
+
+
 # --------------------------------------------------------------------- main
 
 def profile_help():
@@ -1070,6 +1448,7 @@ def build_parser():
     ap = argparse.ArgumentParser(prog="sessions", parents=[common],
                                  description=__doc__.split("\n")[0])
     sub = ap.add_subparsers(dest="cmd")
+    add_init_parser(sub)
     sub.add_parser("status", parents=[common], help="registry sessions: live / missing (default)")
     add_up_parser(sub, common)
     add_new_parser(sub, common)
@@ -1087,6 +1466,16 @@ def build_parser():
     sub.add_parser("doctor", parents=[common], help="stale sockets, idle spares, transcript checks")
     add_send_parser(sub, common)
     return ap
+
+
+def add_init_parser(sub):
+    """No --profile: init writes every profile it finds."""
+    ini = sub.add_parser("init", help="write the config from the Claude Code accounts on this machine")
+    ini.add_argument("--dry-run", action="store_true", help="print what it would write; write nothing")
+    ini.add_argument("--yes", action="store_true", help="no confirmation prompts")
+    ini.add_argument("--force", action="store_true", help="replace an existing config, keeping a .bak copy")
+    ini.add_argument("--config-dir", action="append", default=[], metavar="DIR",
+                     help="another Claude Code config dir to include (repeatable)")
 
 
 def add_up_parser(sub, common):
@@ -1179,11 +1568,29 @@ HANDLERS = {None: cmd_status, "status": cmd_status, "up": cmd_up, "new": cmd_new
             "doctor": cmd_doctor, "send": cmd_send}
 
 
+def wants_init(argv):
+    """True when the subcommand is init, told before the config is read: init must run
+    without a config file, and with a broken one it is about to replace."""
+    rest = list(argv)
+    while rest:
+        a = rest.pop(0)
+        if a == "--profile":
+            rest[:1] = []
+        elif not a.startswith("-"):
+            return a == "init"
+    return False
+
+
 def main():
     global CONFIG
     path = config_path()
-    CONFIG = load_config(path) if path.is_file() else None
+    if not wants_init(sys.argv[1:]):
+        CONFIG = load_config(path) if path.is_file() else None
     args = build_parser().parse_args()      # --help works before a config exists
+    if args.cmd == "init":
+        if hasattr(args, "profile"):
+            sys.exit("sessions init takes no --profile: it writes a profile for every account it finds")
+        return cmd_init(args)
     if CONFIG is None:
         missing_config(path)
     return HANDLERS[args.cmd](args)
